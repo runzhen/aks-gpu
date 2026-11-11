@@ -6,6 +6,9 @@ pushallcuda: (pushcuda) (pushcudalts)
 
 pushallgrid: (pushgrid) (pushgridv20)
 
+pushamd: (buildamd)
+	docker push {{ registry }}/aks-gpu:$(yq e '.amd.version' driver_config.yml)-amd
+
 pushcuda: (buildcuda)
 	docker push {{ registry }}/aks-gpu:$(yq e '.cuda.version' driver_config.yml)-cuda
 
@@ -29,3 +32,6 @@ buildcuda:
 
 buildcudalts:
 	docker build --build-arg DRIVER_KIND=cuda --build-arg DRIVER_VERSION=$(yq e '.cuda_lts.version' driver_config.yml) -f Dockerfile -t {{ registry }}/aks-gpu:$(yq e '.cuda_lts.version' driver_config.yml)-cuda-lts .
+
+buildamd:
+	docker build --platform linux/amd64 --build-arg DRIVER_URL=$(yq e '.amd.url' driver_config.yml) --build-arg DRIVER_SHA256=$(yq e '.amd.sha256' driver_config.yml) --build-arg DRIVER_KIND=amd --build-arg DRIVER_VERSION=$(yq e '.amd.version' driver_config.yml) -f Dockerfile -t {{ registry }}/aks-gpu:$(yq e '.amd.version' driver_config.yml)-amd .

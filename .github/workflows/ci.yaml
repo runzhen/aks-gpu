@@ -225,12 +225,85 @@ jobs:
             rm -rf /tmp/.buildx-cache
             mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
+  amd:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_REPO: aks-gpu-amd
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+      - name: Load AMD config
+        id: load_config
+        run: |
+          amd_version=$(yq e ".amd.version" driver_config.yml)
+          amd_url=$(yq e ".amd.url" driver_config.yml)
+          amd_sha256=$(yq e ".amd.sha256" driver_config.yml)
+          if [[ ! "$amd_version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "::error::Refusing unexpected AMD ROCm version: $amd_version"
+            exit 1
+          fi
+          if [[ ! "$amd_url" =~ ^https://[A-Za-z0-9._~:/?#@%+=-]+$ ]]; then
+            echo "::error::Refusing unexpected AMD driver URL: $amd_url"
+            exit 1
+          fi
+          if [[ ! "$amd_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Refusing unexpected AMD driver sha256: $amd_sha256"
+            exit 1
+          fi
+          echo "AMD_VERSION=$amd_version"
+          echo "amd_version=$amd_version" >> "$GITHUB_OUTPUT"
+          echo "amd_url=$amd_url" >> "$GITHUB_OUTPUT"
+          echo "amd_sha256=$amd_sha256" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Cache Docker layers
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-aks-gpu-amd-${{ steps.load_config.outputs.amd_version }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-aks-gpu-amd-${{ steps.load_config.outputs.amd_version }}
+      - name: Generate timestamp
+        id: timestamp
+        run: echo "timestamp=$(date +'%Y%m%d%H%M%S')" >> "$GITHUB_OUTPUT"
+      - uses: paulhatch/semantic-version@9f72830310d5ed81233b641ee59253644cd8a8fc # v6.0.2
+        with:
+          bump_each_commit: false
+          version_format: "${{ steps.load_config.outputs.amd_version }}-${{ steps.timestamp.outputs.timestamp }}"
+        id: semver
+      - name: 'Check version'
+        env:
+          VERSION: ${{ steps.semver.outputs.version }}
+          VERSION_TAG: ${{ steps.semver.outputs.version_tag }}
+        run: |
+          echo "version is $VERSION"
+          echo "version is $VERSION_TAG"
+      - name: 'Build and Push'
+        env:
+          DRIVER_URL: ${{ steps.load_config.outputs.amd_url }}
+          DRIVER_SHA256: ${{ steps.load_config.outputs.amd_sha256 }}
+          DRIVER_VERSION: ${{ steps.load_config.outputs.amd_version }}
+          REGISTRY_SERVER: ${{ secrets.AZURE_REGISTRY_SERVER }}
+          VERSION: ${{ steps.semver.outputs.version }}
+        run: |
+          set -x
+          echo "tag is: "
+          echo "$VERSION"
+          image_ref="${REGISTRY_SERVER}/public/aks/${IMAGE_REPO}:${VERSION}"
+          docker buildx build --platform linux/amd64 --build-arg "DRIVER_URL=${DRIVER_URL}" --build-arg "DRIVER_SHA256=${DRIVER_SHA256}" --build-arg DRIVER_KIND=amd --build-arg "DRIVER_VERSION=${DRIVER_VERSION}" --cache-from=type=local,src=/tmp/.buildx-cache --cache-to=type=local,dest=/tmp/.buildx-cache-new --output=type=docker -t "$image_ref" .
+          docker images
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - name: Shellcheck prebake scripts
-        run: shellcheck -S warning install.sh entrypoint.sh
+        run: shellcheck -S warning install.sh entrypoint.sh download.sh
       - name: Install bats
         run: |
           sudo apt-get update

@@ -22,6 +22,43 @@ elif [ $TARGETARCH = "amd64" ]; then
     NVIDIA_FM_ARCH="x86_64"
 fi
 
+# download_amd_packages caches the minimal AMD host stack (amdgpu-dkms + ROCm SMI) as debs, the
+# AMD counterpart of caching the NVIDIA runfile. The amdgpu-install package only configures the
+# repo.radeon.com apt repositories for the pinned ROCm release; the packages themselves are
+# downloaded (not installed) so the node needs no access to those repositories at boot.
+download_amd_packages () {
+    if [[ "${TARGETARCH}" != "amd64" ]]; then
+        echo "AMD GPU driver is only supported on amd64 architecture"
+        exit 1
+    fi
+    if [[ -z "${DRIVER_URL:-}" || -z "${DRIVER_SHA256:-}" ]]; then
+        echo "DRIVER_URL and DRIVER_SHA256 are required for the amd driver kind"
+        exit 1
+    fi
+
+    local installer_deb
+    installer_deb="$(basename "${DRIVER_URL}")"
+    curl -fsSLO "${DRIVER_URL}"
+    echo "${DRIVER_SHA256}  ${installer_deb}" | sha256sum -c -
+    apt-get install -y --no-install-recommends "./${installer_deb}"
+    apt-get update
+
+    local amd_debs=/opt/gpu/amd-debs
+    mkdir -p "${amd_debs}/partial"
+    # shellcheck disable=SC2086 # AMD_PACKAGES is an intentionally word-split package list
+    apt-get install -y --no-install-recommends --download-only \
+        -o Dir::Cache::archives="${amd_debs}" ${AMD_PACKAGES}
+    rm -rf "${amd_debs}/partial" "${amd_debs}/lock"
+    ls "${amd_debs}"/amdgpu-dkms_*.deb
+}
+
+if [[ "${DRIVER_KIND}" == "amd" ]]; then
+    download_amd_packages
+    popd || exit
+    rm -r "$workdir"
+    exit 0
+fi
+
 if [[ "${DRIVER_KIND}" == "cuda" ]]; then
     RUNFILE="NVIDIA-Linux-${NVIDIA_DRIVER_ARCH}-${DRIVER_VERSION}"
     curl -fsSLO https://us.download.nvidia.com/tesla/${DRIVER_VERSION}/${RUNFILE}.run 

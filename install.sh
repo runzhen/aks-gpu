@@ -100,6 +100,11 @@ install_nvidia_container_toolkit() {
 # userspace libraries. It performs NO device access, so it is safe to run at VHD build time on
 # a host without a GPU.
 build_kernel_module() {
+    if [[ "${DRIVER_KIND}" == "amd" ]]; then
+        build_amd_kernel_module
+        return
+    fi
+
     # blacklist nouveau driver, nvidia driver dependency
     cp /opt/gpu/blacklist-nouveau.conf /etc/modprobe.d/blacklist-nouveau.conf
     update-initramfs -u
@@ -148,6 +153,110 @@ build_kernel_module() {
     # validate that the kernel module was built and registered (no device access required)
     dkms status
     modinfo -k "$KERNEL_NAME" nvidia
+}
+
+# install cached AMD debs (amdgpu-dkms, rocm-smi-lib, ...) staged by download.sh. Dependencies that
+# were already present in the image build container are not cached; apt resolves any that the host
+# lacks from its own repositories.
+install_cached_amd_packages() {
+    apt-get install -y --no-install-recommends /opt/gpu/amd-debs/*.deb
+}
+
+# configure_amdgpu_dkms_patches registers the DKMS patch that adapts amdgpu to kernels whose
+# pci_resize_resource() signature changed (same workaround as Azure/azhpc-images). It must be in
+# place before amdgpu-dkms is installed so the module is built with it.
+configure_amdgpu_dkms_patches() {
+    local dkms_etc="${AKSGPU_DKMS_ETC:-/etc/dkms}"
+    mkdir -p "${dkms_etc}/amdgpu/patches"
+    cp /opt/gpu/amdgpu-pci-resize-resource-exclude-bars.patch "${dkms_etc}/amdgpu/patches/pci-resize-resource-exclude-bars.patch"
+    cp /opt/gpu/amdgpu-dkms.conf "${dkms_etc}/amdgpu.conf"
+}
+
+# build_amd_kernel_module is the AMD counterpart of build_kernel_module: it installs the cached
+# amdgpu-dkms + ROCm SMI packages and makes sure the module is built for the target kernel. Like the
+# NVIDIA path it performs NO device access, so it is safe to run on a GPU-less VHD builder.
+build_amd_kernel_module() {
+    if [[ "${ARCH}" != "x86_64" ]]; then
+        echo "AMD GPU driver is only supported on x86_64 architecture"
+        exit 1
+    fi
+
+    configure_amdgpu_dkms_patches
+    use_package_manager_with_retries wait_for_dpkg_lock install_cached_amd_packages 10 3
+
+    # The package post-install only builds for the running kernel (and only when its headers are
+    # present). At VHD build time the target kernel differs from the builder's running kernel, so
+    # build it explicitly when it is not already installed.
+    if ! dkms status amdgpu -k "${KERNEL_NAME}" | grep -q ': installed'; then
+        dkms autoinstall -k "${KERNEL_NAME}"
+    fi
+
+    # validate that the kernel module was built and registered (no device access required)
+    dkms status
+    if ! dkms status amdgpu -k "${KERNEL_NAME}" | grep -q ': installed'; then
+        echo "aks-gpu: amdgpu DKMS module is not installed for kernel ${KERNEL_NAME}"
+        return 1
+    fi
+    modinfo -k "${KERNEL_NAME}" amdgpu
+}
+
+# amd_mi300_gpu_count counts MI300X (1002:74b5) and MI300HF (1002:74bd) PCI devices via sysfs.
+# The PCI root is overridable (AKSGPU_PCI_ROOT) so the unit tests can point it at a fixture dir.
+amd_mi300_gpu_count() {
+    local pci_root="${AKSGPU_PCI_ROOT:-/sys/bus/pci/devices}"
+    local d count=0
+    for d in "${pci_root}"/*; do
+        [ -r "${d}/vendor" ] && [ -r "${d}/device" ] || continue
+        [ "$(cat "${d}/vendor")" = "0x1002" ] || continue
+        case "$(cat "${d}/device")" in
+            0x74b5|0x74bd) count=$((count + 1)) ;;
+        esac
+    done
+    echo "${count}"
+}
+
+# kfd_ready succeeds once the AMD compute (KFD) character device exists.
+kfd_ready() { [ -c /dev/kfd ]; }
+
+# initialize_amd_driver runs the steps that require the physical GPU and therefore must execute at
+# node boot, regardless of whether the kernel module was prebuilt into the VHD.
+initialize_amd_driver() {
+    ldconfig
+
+    # 8-GPU MI300X/MI300HF systems need the Hyper-V synthetic DRM driver unloaded and the amdgpu
+    # IP block mask restricted (same as Azure/azhpc-images' ND MI300X mode probe).
+    if [ "$(amd_mi300_gpu_count)" -eq 8 ]; then
+        modprobe -r hyperv_drm || true
+        modprobe amdgpu ip_block_mask=0x7f
+    else
+        modprobe amdgpu
+    fi
+
+    # /dev/kfd is created once amdgpu has initialized the compute (KFD) interface
+    local _
+    for _ in $(seq 1 "${AKSGPU_AMD_KFD_WAIT_SECONDS:-120}"); do
+        kfd_ready && break
+        sleep 1
+    done
+    if ! kfd_ready; then
+        echo "aks-gpu: /dev/kfd did not appear after loading amdgpu"
+        return 1
+    fi
+
+    "${AKSGPU_ROCM_SMI_BIN:-/opt/rocm/bin/rocm-smi}"
+}
+
+# configure_amd_runtime grants containers access to /dev/kfd and /dev/dri/renderD* (consumed by the
+# AMD device plugin) and exposes the ROCm host libraries to the dynamic linker.
+configure_amd_runtime() {
+    local udev_rules_dir="${AKSGPU_UDEV_RULES_DIR:-/etc/udev/rules.d}"
+    mkdir -p "${udev_rules_dir}"
+    cp /opt/gpu/99-amdgpu-permissive.rules "${udev_rules_dir}/99-amdgpu-permissive.rules"
+    udevadm control --reload-rules
+    udevadm trigger
+
+    echo /opt/rocm/lib > /etc/ld.so.conf.d/rocm.conf
+    ldconfig
 }
 
 # initialize_nvidia_driver runs the steps that require the physical GPU and therefore must
@@ -244,6 +353,11 @@ build_and_mark() {
     write_dkms_marker
 }
 
+# driver_module_name returns the kernel module name for the configured driver kind.
+driver_module_name() {
+    if [[ "${DRIVER_KIND}" == "amd" ]]; then echo amdgpu; else echo nvidia; fi
+}
+
 # fast_path_ok opportunistically validates a prebaked module without recompiling. It returns
 # non-zero (instead of aborting under `set -e`) so a corrupt or incomplete prebake falls back to
 # a full build rather than bricking the node. The authoritative device check still happens later
@@ -251,7 +365,7 @@ build_and_mark() {
 fast_path_ok() {
     ldconfig || return 1
     dkms status >/dev/null 2>&1 || return 1
-    modinfo -k "${KERNEL_NAME}" nvidia >/dev/null 2>&1 || return 1
+    modinfo -k "${KERNEL_NAME}" "$(driver_module_name)" >/dev/null 2>&1 || return 1
 }
 
 # purge_gpu_cache removes the gpu cache that entrypoint.sh staged under /opt/gpu once install.sh
@@ -306,8 +420,13 @@ main() {
         build_and_mark
     fi
 
-    initialize_nvidia_driver
-    configure_nvidia_container_runtime
+    if [[ "${DRIVER_KIND}" == "amd" ]]; then
+        initialize_amd_driver
+        configure_amd_runtime
+    else
+        initialize_nvidia_driver
+        configure_nvidia_container_runtime
+    fi
 
     purge_gpu_cache
 }

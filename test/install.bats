@@ -354,3 +354,195 @@ EOF
     [[ "$output" != *"dpkg"* ]]
     [[ "$output" != *"nvidia-imex.service"* ]]
 }
+
+# --- AMD (ROCm) driver kind ----------------------------------------------
+
+@test "build_kernel_module delegates to the AMD build for driver kind amd" {
+    DRIVER_KIND="amd"
+    build_amd_kernel_module() { echo "BUILD_AMD"; }
+    cp() { echo "unexpected cp $*"; }   # the NVIDIA path would start by copying the nouveau blacklist
+    run build_kernel_module
+    [ "$status" -eq 0 ]
+    [ "$output" = "BUILD_AMD" ]
+}
+
+@test "build_amd_kernel_module rejects non-x86_64" {
+    DRIVER_KIND="amd"; ARCH="aarch64"
+    run build_amd_kernel_module
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"only supported on x86_64"* ]]
+}
+
+@test "build_amd_kernel_module installs packages and builds the target kernel when not yet installed" {
+    DRIVER_KIND="amd"; ARCH="x86_64"; KERNEL_NAME="6.8.0-1059-azure"
+    configure_amdgpu_dkms_patches() { echo configure_patches >> "${TEST_TMP}/amd-calls"; }
+    use_package_manager_with_retries() { echo "install $2" >> "${TEST_TMP}/amd-calls"; }
+    modinfo() { :; }
+    dkms() {
+        echo "dkms $*" >> "${TEST_TMP}/amd-calls"
+        # first status query: module not built for the target kernel; after autoinstall: installed
+        if [ "$1" = "status" ] && [ "$#" -gt 1 ] && grep -q autoinstall "${TEST_TMP}/amd-calls"; then
+            echo "amdgpu/6.12.12, ${KERNEL_NAME}, x86_64: installed"
+        fi
+        return 0
+    }
+
+    run build_amd_kernel_module
+
+    [ "$status" -eq 0 ]
+    run cat "${TEST_TMP}/amd-calls"
+    [[ "$output" == *"install install_cached_amd_packages"* ]]
+    [[ "$output" == *"dkms autoinstall -k 6.8.0-1059-azure"* ]]
+    # patches must be configured before the module is built
+    [ "$(sed -n 1p "${TEST_TMP}/amd-calls")" = "configure_patches" ]
+}
+
+@test "build_amd_kernel_module skips the explicit build when postinst already installed the module" {
+    DRIVER_KIND="amd"; ARCH="x86_64"; KERNEL_NAME="6.8.0-1059-azure"
+    configure_amdgpu_dkms_patches() { :; }
+    use_package_manager_with_retries() { :; }
+    modinfo() { :; }
+    dkms() {
+        echo "dkms $*" >> "${TEST_TMP}/amd-calls"
+        if [ "$1" = "status" ]; then echo "amdgpu/6.12.12, ${KERNEL_NAME}, x86_64: installed"; fi
+    }
+
+    run build_amd_kernel_module
+
+    [ "$status" -eq 0 ]
+    run cat "${TEST_TMP}/amd-calls"
+    [[ "$output" != *"autoinstall"* ]]
+}
+
+@test "build_amd_kernel_module fails when the module is not installed for the target kernel" {
+    DRIVER_KIND="amd"; ARCH="x86_64"; KERNEL_NAME="6.8.0-1059-azure"
+    configure_amdgpu_dkms_patches() { :; }
+    use_package_manager_with_retries() { :; }
+    modinfo() { :; }
+    dkms() { :; }   # never reports the module as installed
+
+    run build_amd_kernel_module
+
+    [ "$status" -ne 0 ]
+}
+
+@test "driver_module_name is amdgpu for amd and nvidia otherwise" {
+    DRIVER_KIND="amd";  [ "$(driver_module_name)" = "amdgpu" ]
+    DRIVER_KIND="cuda"; [ "$(driver_module_name)" = "nvidia" ]
+    DRIVER_KIND="grid"; [ "$(driver_module_name)" = "nvidia" ]
+}
+
+@test "fast_path_ok probes the amdgpu module for driver kind amd" {
+    DRIVER_KIND="amd"
+    ldconfig() { :; }; dkms() { :; }
+    modinfo() { echo "modinfo $*" >> "${TEST_TMP}/modinfo-calls"; }
+    run fast_path_ok
+    [ "$status" -eq 0 ]
+    run cat "${TEST_TMP}/modinfo-calls"
+    [[ "$output" == *" amdgpu" ]]
+}
+
+@test "baked_marker_matches fails when a cuda marker meets an amd node" {
+    write_dkms_marker
+    DRIVER_KIND="amd"
+    run baked_marker_matches
+    [ "$status" -ne 0 ]
+}
+
+_fake_pci_device() {  # <name> <vendor> <device>
+    mkdir -p "${TEST_TMP}/pci/$1"
+    echo "$2" > "${TEST_TMP}/pci/$1/vendor"
+    echo "$3" > "${TEST_TMP}/pci/$1/device"
+}
+
+@test "amd_mi300_gpu_count counts only AMD MI300X/MI300HF devices" {
+    export AKSGPU_PCI_ROOT="${TEST_TMP}/pci"
+    _fake_pci_device 0000:01:00.0 0x1002 0x74b5
+    _fake_pci_device 0000:02:00.0 0x1002 0x74bd
+    _fake_pci_device 0000:03:00.0 0x1002 0x740c   # MI200: not counted
+    _fake_pci_device 0000:04:00.0 0x10de 0x74b5   # other vendor: not counted
+    run amd_mi300_gpu_count
+    [ "$status" -eq 0 ]
+    [ "$output" = "2" ]
+}
+
+@test "initialize_amd_driver restricts IP blocks on 8-GPU MI300X systems" {
+    export AKSGPU_PCI_ROOT="${TEST_TMP}/pci"
+    local n
+    for n in 1 2 3 4 5 6 7 8; do _fake_pci_device "0000:0${n}:00.0" 0x1002 0x74b5; done
+    ldconfig() { :; }
+    modprobe() { echo "modprobe $*" >> "${TEST_TMP}/modprobe-calls"; }
+    export AKSGPU_AMD_KFD_WAIT_SECONDS=1
+    export AKSGPU_ROCM_SMI_BIN="${TEST_TMP}/bin/rocm-smi"; _stub_bin rocm-smi 0
+    kfd_ready() { return 0; }
+
+    run initialize_amd_driver
+
+    [ "$status" -eq 0 ]
+    run cat "${TEST_TMP}/modprobe-calls"
+    [[ "$output" == *"modprobe -r hyperv_drm"* ]]
+    [[ "$output" == *"modprobe amdgpu ip_block_mask=0x7f"* ]]
+}
+
+@test "initialize_amd_driver does a plain modprobe on other AMD GPUs" {
+    export AKSGPU_PCI_ROOT="${TEST_TMP}/pci"
+    mkdir -p "${AKSGPU_PCI_ROOT}"
+    ldconfig() { :; }
+    modprobe() { echo "modprobe $*" >> "${TEST_TMP}/modprobe-calls"; }
+    export AKSGPU_AMD_KFD_WAIT_SECONDS=1
+    export AKSGPU_ROCM_SMI_BIN="${TEST_TMP}/bin/rocm-smi"; _stub_bin rocm-smi 0
+    kfd_ready() { return 0; }
+
+    run initialize_amd_driver
+
+    [ "$status" -eq 0 ]
+    run cat "${TEST_TMP}/modprobe-calls"
+    [ "$output" = "modprobe amdgpu" ]
+}
+
+@test "initialize_amd_driver fails when /dev/kfd never appears" {
+    export AKSGPU_PCI_ROOT="${TEST_TMP}/pci"
+    mkdir -p "${AKSGPU_PCI_ROOT}"
+    ldconfig() { :; }
+    modprobe() { :; }
+    sleep() { :; }
+    export AKSGPU_AMD_KFD_WAIT_SECONDS=2
+    export AKSGPU_ROCM_SMI_BIN="${TEST_TMP}/bin/rocm-smi"; _stub_bin rocm-smi 0
+    kfd_ready() { return 1; }
+
+    run initialize_amd_driver
+
+    [ "$status" -ne 0 ]
+}
+
+@test "configure_amd_runtime installs the permissive udev rules and reloads udev" {
+    export AKSGPU_UDEV_RULES_DIR="${TEST_TMP}/udev"
+    cp() { echo "cp $*" >> "${TEST_TMP}/udev-calls"; }
+    udevadm() { echo "udevadm $*" >> "${TEST_TMP}/udev-calls"; }
+    ldconfig() { :; }
+    # keep the ld.so.conf.d write out of the real filesystem
+    echo() { if [ "$1" = "/opt/rocm/lib" ]; then builtin echo "ldconf" >> "${TEST_TMP}/udev-calls"; else builtin echo "$@"; fi; }
+
+    run configure_amd_runtime
+
+    [ "$status" -eq 0 ]
+    run cat "${TEST_TMP}/udev-calls"
+    [[ "$output" == *"cp /opt/gpu/99-amdgpu-permissive.rules ${TEST_TMP}/udev/99-amdgpu-permissive.rules"* ]]
+    [[ "$output" == *"udevadm control --reload-rules"* ]]
+    [[ "$output" == *"udevadm trigger"* ]]
+}
+
+@test "dispatch amd: initializes the AMD driver and runtime, not the NVIDIA ones" {
+    _stub_dispatch
+    initialize_amd_driver() { touch "${TEST_TMP}/initialize_amd_driver.ran"; }
+    configure_amd_runtime() { touch "${TEST_TMP}/configure_amd_runtime.ran"; }
+    DRIVER_KIND="amd"
+    AKSGPU_BUILD_ONLY=0; AKSGPU_SKIP_KERNEL_BUILD=0
+    run main
+    [ "$status" -eq 0 ]
+    [ -f "${TEST_TMP}/build_and_mark.ran" ]
+    [ -f "${TEST_TMP}/initialize_amd_driver.ran" ]
+    [ -f "${TEST_TMP}/configure_amd_runtime.ran" ]
+    [ ! -f "${TEST_TMP}/initialize_nvidia_driver.ran" ]
+    [ ! -f "${TEST_TMP}/configure_nvidia_container_runtime.ran" ]
+}

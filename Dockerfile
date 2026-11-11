@@ -6,6 +6,7 @@ RUN apt update && apt upgrade -y && apt install -y curl xz-utils gnupg2 ca-certi
 
 ARG DRIVER_VERSION
 ARG DRIVER_URL
+ARG DRIVER_SHA256
 ARG DRIVER_KIND="cuda"
 ARG TARGETARCH
 
@@ -14,6 +15,9 @@ COPY 10-nvidia-runtime.toml 10-nvidia-runtime.toml
 COPY 71-nvidia-char-dev.rules 71-nvidia-char-dev.rules
 COPY blacklist-nouveau.conf blacklist-nouveau.conf
 COPY nvidia-persistenced.service nvidia-persistenced.service
+COPY 99-amdgpu-permissive.rules 99-amdgpu-permissive.rules
+COPY amdgpu-dkms.conf amdgpu-dkms.conf
+COPY amdgpu-pci-resize-resource-exclude-bars.patch amdgpu-pci-resize-resource-exclude-bars.patch
 
 COPY fm_run_package_installer.sh fm_run_package_installer.sh
 COPY config.sh config.sh

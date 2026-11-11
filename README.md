@@ -1,7 +1,7 @@
 # Driver container image for AKS VHD
 
 This repo provides steps to build a container image with all components required for 
-Kubernetes Nvidia GPU integration. Run it as a privileged container in the host PID namespace.
+Kubernetes Nvidia GPU integration (AMD GPUs are supported through `DRIVER_KIND=amd`, see below). Run it as a privileged container in the host PID namespace.
 It will enter the host mount namespace and install the nvidia drivers, container runtime, 
 and associated libraries on the host, validating their functionality
 
@@ -32,6 +32,28 @@ and [upstream reports that this Kit version does not support 59x drivers](https:
 This is not a guarantee for every application: the separate MIG/vGPU identifier
 bug in that issue requires a newer Kit version, even with a supported driver.
 The exact application workload still needs validation on its target SKU.
+
+## AMD GPU (ROCm) driver
+
+`DRIVER_KIND=amd` builds an image for AMD Instinct GPUs (for example ND MI300X v5). It follows the
+AMD install flow of [Azure/azhpc-images](https://github.com/Azure/azhpc-images/blob/master/components/install_rocm.sh)
+for Ubuntu 24.04 (ROCm 6.4.4, x86_64 only) and mirrors the NVIDIA flow in this repo:
+
+| Step | NVIDIA | AMD |
+| --- | --- | --- |
+| Image build (`download.sh`) | download + extract `.run` | download `amdgpu-install` deb (sha256-verified), cache `amdgpu-dkms`, `rocm-core`, `rocm-smi-lib` debs in `/opt/gpu/amd-debs` |
+| Kernel module (`build_kernel_module`) | `nvidia-installer --dkms` | `amdgpu-dkms` (+ the azhpc `pci_resize_resource` DKMS patch), built for the target kernel |
+| Device init (node boot) | `nvidia-modprobe`, `nvidia-smi`, fabric manager / IMEX | `modprobe amdgpu` (8x MI300X: unload `hyperv_drm`, `ip_block_mask=0x7f`), wait for `/dev/kfd`, `rocm-smi` |
+| Container access | NVIDIA container toolkit + CDI | permissive udev rules for `/dev/kfd` and `/dev/dri/renderD*`, consumed by the AMD device plugin |
+
+Only the host driver and ROCm SMI are installed; HIP/RCCL and the rest of ROCm come from workload containers.
+The prebake modes (`build-only`, `install-skip-build`) and the dkms marker work the same way (`driver_kind=amd`).
+
+```
+just buildamd
+```
+
+The ROCm release, installer URL and sha256 live under `amd` in [driver_config.yml](./driver_config.yml).
 
 ## Build
 ```
